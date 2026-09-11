@@ -25,16 +25,23 @@ def deduplicate_companies(candidates: list[Company]) -> list[Company]:
             unique[key] = candidate
             continue
 
-        existing.discovery_sources.extend(candidate.discovery_sources)
-        if not existing.website and candidate.website:
-            existing.website = candidate.website
-        if not existing.description and candidate.description:
-            existing.description = candidate.description
-        if not existing.github_url and candidate.github_url:
-            existing.github_url = candidate.github_url
-            existing.github_stars = candidate.github_stars
-            existing.open_source = candidate.open_source
-        if not existing.source_url and candidate.source_url:
-            existing.source_url = candidate.source_url
+        merge_company_records(existing, candidate)
     return list(unique.values())
 
+
+def merge_company_records(primary: Company, duplicate: Company) -> Company:
+    """Keep the first record while retaining useful discovery metadata from a duplicate."""
+    for source in duplicate.discovery_sources:
+        if source not in primary.discovery_sources:
+            primary.discovery_sources.append(source)
+    if not primary.website and duplicate.website:
+        primary.website = duplicate.website
+    if not primary.description and duplicate.description:
+        primary.description = duplicate.description
+    if not primary.github_url and duplicate.github_url:
+        primary.github_url = duplicate.github_url
+        primary.github_stars = duplicate.github_stars
+        primary.open_source = duplicate.open_source
+    if not primary.source_url and duplicate.source_url:
+        primary.source_url = duplicate.source_url
+    return primary

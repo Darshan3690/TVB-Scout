@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable
 
-from agent.dedup import deduplicate_companies
+from agent.dedup import candidate_key, deduplicate_companies, merge_company_records
 from agent.discovery import WebDiscovery
 from agent.filter import classify
 from agent.github_discovery import GitHubDiscovery
@@ -32,11 +32,17 @@ class ScoutRun:
 
 
 class ScoutOrchestrator:
-    def __init__(self, event_callback: EventCallback | None = None) -> None:
-        search = SearchClient()
-        self.web_discovery = WebDiscovery(search)
-        self.github_discovery = GitHubDiscovery()
-        self.researcher = Researcher(search)
+    def __init__(
+        self,
+        event_callback: EventCallback | None = None,
+        web_discovery: WebDiscovery | None = None,
+        github_discovery: GitHubDiscovery | None = None,
+        researcher: Researcher | None = None,
+    ) -> None:
+        search = SearchClient() if not (web_discovery and researcher) else None
+        self.web_discovery = web_discovery or WebDiscovery(search or SearchClient())
+        self.github_discovery = github_discovery or GitHubDiscovery()
+        self.researcher = researcher or Researcher(search or SearchClient())
         self.event_callback = event_callback
 
     def run(
@@ -48,6 +54,7 @@ class ScoutOrchestrator:
         run = ScoutRun()
         all_candidates: list[Company] = []
         processed_keys: set[str] = set()
+        result_by_key: dict[str, Company] = {}
 
         for round_index in range(max_discovery_rounds):
             if len(run.qualified_leads) >= target_leads:
@@ -82,6 +89,18 @@ class ScoutOrchestrator:
                     researched.rejection_reason = f"Research failed: {type(error).__name__}"
                     self._emit(run, f"[RESEARCH] Failed safely for {candidate.company_name}")
                 run.researched_companies += 1
+                self._emit(run, f"  funding_verified={researched.funding_verified}  usd={researched.funding_usd}  ({researched.funding_or_revenue})")
+                self._emit(run, f"  tech_verified={researched.tech_verified}  ({researched.tech_platform[:60] if researched.tech_platform else '-'})")
+                self._emit(run, f"  us_presence_verified={researched.us_presence_verified}  ({researched.us_presence[:60] if researched.us_presence else '-'})")
+                self._emit(run, f"  founder={researched.founder_name!r}  role={researched.founder_role!r}")
+                self._emit(run, f"  email_verified={researched.email_verified}  ({researched.founder_email or '-'})")
+
+                resolved_key = candidate_key(researched)
+                if existing := result_by_key.get(resolved_key):
+                    merge_company_records(existing, researched)
+                    self._emit(run, f"[DEDUP] Post-research duplicate: {researched.company_name}")
+                    continue
+                result_by_key[resolved_key] = researched
                 classify(researched)
                 if researched.qualified:
                     run.qualified_leads.append(researched)
@@ -92,6 +111,7 @@ class ScoutOrchestrator:
                 if len(run.qualified_leads) >= target_leads:
                     break
 
+        run.unique_companies = len(result_by_key)
         self._emit(run, f"[COMPLETE] {len(run.qualified_leads)} qualified leads found")
         return run
 

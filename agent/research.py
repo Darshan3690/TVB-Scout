@@ -12,11 +12,29 @@ from utils.search import SearchClient, SearchResult
 from utils.sources import normalize_domain
 
 MONEY_PATTERN = re.compile(
-    r"(?P<prefix>US\$|USD\s?|\$)\s?(?P<amount>\d+(?:\.\d+)?)\s?(?P<unit>[kKmMbB]|million|mn|billion|bn)?",
+    r"(?P<prefix>US\$|USD\s?|\$|£|€|GBP\s?|EUR\s?)\s?(?P<amount>\d+(?:\.\d+)?)\s?(?P<unit>[kKmMbB]|million|mn|billion|bn)?",
     re.IGNORECASE,
 )
 FOUNDER_PATTERN = re.compile(
-    r"(?P<name>[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*(?:,|[-|])?\s*(?P<role>Founder(?:\s*&\s*CEO)?|Co-founder(?:\s*&\s*CEO)?|CEO|Founder and CEO)",
+    r"(?P<name>[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*(?:,|[-|])?\s*"
+    r"(?P<role>Founder(?:\s*&\s*CEO)?|Co-founder(?:\s*&\s*CEO)?|CEO|Founder and CEO"
+    r"|Co-Founder(?:\s*&\s*CEO)?|Managing Director|MD(?:\s*&\s*CEO)?|President(?:\s*&\s*CEO)?)",
+)
+# Detects non-US headquarters in evidence text
+NON_US_HQ_PATTERN = re.compile(
+    r"\b(founded|headquartered|based|incorporated|offices?|operating|operates?|located|registered)\b[^.]{0,150}\b"
+    r"(india|africa|kenya|nigeria|ghana|south africa|rwanda|ethiopia|egypt|morocco|senegal|tanzania|uganda|"
+    r"europe|germany|france|uk|united kingdom|netherlands|sweden|denmark|poland|spain|italy|portugal|"
+    r"brazil|mexico|colombia|argentina|chile|peru|latin america|"
+    r"singapore|indonesia|philippines|vietnam|thailand|malaysia|myanmar|"
+    r"middle east|uae|dubai|saudi arabia|israel|jordan|pakistan|bangladesh|sri lanka)",
+    re.I,
+)
+US_HQ_PATTERN = re.compile(
+    r"\b(headquartered|based|founded|offices?|incorporated)\b[^.]{0,80}\b"
+    r"(new york|san francisco|silicon valley|boston|chicago|los angeles|seattle|austin|denver|"
+    r"united states|usa|u\.s\.)\b",
+    re.I,
 )
 
 
@@ -40,24 +58,56 @@ class Researcher:
         if website_text and not company.description:
             company.description = website_text[:500]
 
-        funding = self._evidence(name, "funding OR raised OR investment")
+        # Funding — try multiple query angles
+        funding = self._evidence(name, "funding OR raised OR investment OR seed OR Series")
+        funding += self._evidence(name, "revenue OR ARR OR funding round")
         self._apply_funding(company, funding)
 
-        tech = Evidence(website_text, company.website) if website_text else self._first_evidence(name, "platform software SaaS technology")
+        # Technology — try website first, then search
+        tech = Evidence(website_text, company.website) if website_text else Evidence("", "")
         self._apply_technology(company, tech)
+        if not company.tech_verified:
+            tech_search = self._first_evidence(name, "software platform SaaS product technology")
+            self._apply_technology(company, tech_search)
+            tech = tech_search if tech_search.text else tech
 
-        us_presence = self._evidence(name, '"United States" OR USA OR "US office" headquarters')
-        self._apply_us_presence(company, us_presence)
+        # US presence — use website text + targeted search + HQ search
+        us_presence = self._evidence(name, '"United States" OR USA OR "US office" OR headquarters')
+        hq_evidence = self._evidence(name, "founded headquartered based country location")
+        self._apply_us_presence(company, us_presence + hq_evidence, website_text)
 
-        founder = self._evidence(name, 'CEO OR founder OR "co-founder"')
+        # Founder — search + website about/team pages
+        founder = self._evidence(name, 'CEO OR founder OR "co-founder" OR "founding team"')
         self._apply_founder(company, founder)
+        if not company.founder_name and company.website:
+            about_text = self._fetch_subpage(company.website, ["/about", "/team", "/about-us", "/leadership", "/founders"])
+            if about_text:
+                self._apply_founder(company, [Evidence(about_text, company.website + "/about")])
 
         self._apply_llm_hints(company, tech, founder, us_presence)
 
+        # Email — search + try contact/team pages directly
         if company.founder_name and company.website:
-            email = self._evidence(f'"{company.founder_name}"', f'"@{normalize_domain(company.website)}" email')
-            self._apply_email(company, email)
+            domain = normalize_domain(company.website)
+            email_evidence = self._evidence(f'"{company.founder_name}"', f'"@{domain}" email contact')
+            email_evidence += self._evidence(f'"{company.founder_name}" "{name}"', f'email @{domain}')
+            contact_text = self._fetch_subpage(company.website, ["/contact", "/team", "/about", "/about-us", "/founders"])
+            if contact_text:
+                email_evidence.append(Evidence(contact_text, company.website + "/contact"))
+            self._apply_email(company, email_evidence)
         return company
+
+    def _fetch_subpage(self, base_url: str, paths: list[str]) -> str:
+        """Try a list of sub-page paths and return the first non-empty text (>200 chars)."""
+        base = base_url.rstrip("/")
+        for path in paths:
+            try:
+                text = self.search.fetch_text(f"{base}{path}")
+                if text and len(text) > 200:
+                    return text
+            except Exception:  # noqa: BLE001
+                continue
+        return ""
 
     def _apply_llm_hints(
         self,
@@ -133,31 +183,52 @@ class Researcher:
         if not evidence.text:
             return
         match = re.search(
-            r"\b(AI|artificial intelligence|SaaS|developer|fintech|data|automation|cloud|machine learning|software)\b[^.]{0,120}\b(platform|software|infrastructure|tool)\b",
+            r"\b(AI|artificial intelligence|SaaS|developer|fintech|data|automation|cloud|"
+            r"machine learning|software|API|healthtech|edtech|agritech|insurtech|proptech|"
+            r"payments|logistics|ecommerce|analytics)"
+            r"\b[^.]{0,300}\b(platform|software|infrastructure|tool|solution|service|product|system|application|API)\b",
             evidence.text,
             re.I,
         )
         if match:
-            company.tech_platform = match.group(0).strip()
+            company.tech_platform = match.group(0)[:200].strip()
             company.tech_verified = True
             company.tech_source = evidence.url
             if not company.industry:
                 company.industry = match.group(1).title()
 
-    def _apply_us_presence(self, company: Company, evidence: list[Evidence]) -> None:
-        """Only accept affirmative evidence; absence of US results is not evidence of absence."""
-        for item in evidence:
+    def _apply_us_presence(self, company: Company, evidence: list[Evidence], website_text: str = "") -> None:
+        """Accept affirmative evidence of non-US headquarters, explicit no-US, or exclusively-non-US."""
+        all_items = list(evidence)
+        if website_text:
+            all_items.insert(0, Evidence(website_text, company.website or ""))
+
+        for item in all_items:
             normalized = item.text.lower()
+            # Explicit denial of US presence
             if re.search(r"\b(no|without|does not have|doesn't have)\b.{0,45}\b(united states|usa|u\.s\.|us office)\b", normalized):
                 company.us_presence = "Public source states no US presence"
                 company.us_presence_verified = True
                 company.us_presence_source = item.url
                 return
+            # Explicitly operates only outside US
             if re.search(r"\b(exclusively|only)\b.{0,45}\b(india|africa|europe|asia|latin america|middle east)\b", normalized):
                 company.us_presence = "Public source describes operations as outside the US"
                 company.us_presence_verified = True
                 company.us_presence_source = item.url
                 return
+            # Headquartered / founded / based in a non-US country — and no conflicting US HQ
+            if NON_US_HQ_PATTERN.search(item.text) and not US_HQ_PATTERN.search(item.text):
+                country_match = NON_US_HQ_PATTERN.search(item.text)
+                country = country_match.group(2).title() if country_match else "non-US country"
+                company.us_presence = f"Headquartered in {country} per public source"
+                company.us_presence_verified = True
+                company.us_presence_source = item.url
+                return
+
+        # Fallback — US presence mentioned but not verified as non-US
+        for item in evidence:
+            normalized = item.text.lower()
             if re.search(r"\b(united states|usa|u\.s\.|us office|new york|san francisco)\b", normalized):
                 company.us_presence = "US presence reported"
                 company.us_presence_source = item.url
@@ -189,7 +260,14 @@ class Researcher:
         amount = float(match.group("amount"))
         unit = (match.group("unit") or "").lower()
         multiplier = {"k": 1_000, "m": 1_000_000, "million": 1_000_000, "mn": 1_000_000, "b": 1_000_000_000, "billion": 1_000_000_000, "bn": 1_000_000_000}.get(unit, 1)
-        return amount * multiplier
+        prefix = (match.group("prefix") or "").strip().upper()
+        usd = amount * multiplier
+        # Rough currency conversion to USD
+        if prefix in ("£", "GBP"):
+            usd *= 1.27
+        elif prefix in ("€", "EUR"):
+            usd *= 1.10
+        return usd
 
     @staticmethod
     def _extract_money_label(text: str) -> str:

@@ -5,11 +5,14 @@ from __future__ import annotations
 import html
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from utils.logging import get_logger
 
@@ -23,32 +26,55 @@ class SearchResult:
     snippet: str = ""
 
 
-class SearchClient:
-    """Uses SerpAPI when configured, otherwise DuckDuckGo's public HTML endpoint."""
+def _make_session(timeout_seconds: int) -> requests.Session:
+    session = requests.Session()
+    retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+    )
+    return session
 
-    def __init__(self, timeout_seconds: int = 12) -> None:
+
+class SearchClient:
+    """Uses SerpAPI when configured, otherwise tries DuckDuckGo then Bing."""
+
+    def __init__(self, timeout_seconds: int = 15) -> None:
         self.timeout_seconds = timeout_seconds
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 Chrome/124 Safari/537.36"
-                )
-            }
-        )
+        self.session = _make_session(timeout_seconds)
 
     def search(self, query: str, limit: int = 8) -> list[SearchResult]:
-        try:
-            if os.getenv("SERPAPI_KEY"):
+        if os.getenv("SERPAPI_KEY"):
+            try:
                 return self._search_serpapi(query, limit)
-            results = self._search_duckduckgo(query, limit)
-            return results or self._search_bing(query, limit)
-        except requests.RequestException as error:
-            LOGGER.warning("Search failed for %r: %s", query, error)
-            return []
-        except (TypeError, ValueError) as error:
-            LOGGER.warning("Search response could not be read for %r: %s", query, error)
+            except (requests.RequestException, ValueError, TypeError) as error:
+                LOGGER.warning("SerpAPI failed for %r: %s", query, error)
+                return []
+
+        # Try DuckDuckGo first, then Bing — each engine in its own try block so
+        # a DDG timeout does NOT swallow the Bing fallback.
+        ddg_results: list[SearchResult] = []
+        try:
+            ddg_results = self._search_duckduckgo(query, limit)
+        except (requests.RequestException, ValueError, TypeError) as error:
+            LOGGER.warning("DDG failed for %r: %s", query, error)
+
+        if ddg_results:
+            return ddg_results
+
+        try:
+            return self._search_bing(query, limit)
+        except (requests.RequestException, ValueError, TypeError) as error:
+            LOGGER.warning("Bing failed for %r: %s", query, error)
             return []
 
     def fetch_text(self, url: str, max_chars: int = 30_000) -> str:
@@ -106,28 +132,64 @@ class SearchClient:
         return results
 
     def _search_bing(self, query: str, limit: int) -> list[SearchResult]:
-        """Fallback for environments where DuckDuckGo's HTML endpoint is rate-limited."""
+        """Primary keyless fallback. Parses multiple Bing result block formats."""
         response = self.session.get(
             "https://www.bing.com/search",
-            params={"q": query},
+            params={"q": query, "count": min(limit, 10)},
             timeout=self.timeout_seconds,
         )
         response.raise_for_status()
+        page = response.text
         results: list[SearchResult] = []
-        blocks = re.findall(r'<li[^>]+class="b_algo".*?</li>', response.text, flags=re.I | re.S)
+
+        # Bing wraps result URLs in a /ck/a redirect — unwrap to get real URL
+        # Also try multiple element patterns as Bing markup varies by region/version
+        blocks = re.findall(r'<li[^>]+class="[^"]*b_algo[^"]*".*?</li>', page, flags=re.I | re.S)
+        if not blocks:
+            LOGGER.warning("Bing returned no b_algo blocks for %r (possible CAPTCHA/redirect)", query)
+            return []
+
         for block in blocks[:limit]:
-            match = re.search(r'<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', block, flags=re.I | re.S)
-            if not match:
+            href_match = re.search(r'<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', block, flags=re.I | re.S)
+            if not href_match:
+                href_match = re.search(r'<a[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>', block, flags=re.I | re.S)
+            if not href_match:
                 continue
+            raw_url = html.unescape(href_match.group(1))
+            real_url = self._unwrap_bing_url(raw_url)
+            if not real_url.startswith(("http://", "https://")):
+                continue
+            title = self._strip_html(href_match.group(2))
             snippet_match = re.search(r'<p[^>]*>(.*?)</p>', block, flags=re.I | re.S)
-            results.append(
-                SearchResult(
-                    self._strip_html(match.group(2)),
-                    html.unescape(match.group(1)),
-                    self._strip_html(snippet_match.group(1)) if snippet_match else "",
-                )
-            )
+            if not snippet_match:
+                snippet_match = re.search(r'<div[^>]+class="[^"]*b_caption[^"]*"[^>]*>(.*?)</div>', block, flags=re.I | re.S)
+            snippet = self._strip_html(snippet_match.group(1)) if snippet_match else ""
+            results.append(SearchResult(title, real_url, snippet))
+
         return results
+
+    @staticmethod
+    def _unwrap_bing_url(value: str) -> str:
+        """Extract the real destination from a bing.com/ck/a redirect link."""
+        if "bing.com/ck/a" in value or "bing.com/ck/" in value:
+            parsed = urlparse(value)
+            # &u= contains a base64url-like encoded real URL
+            params = parse_qs(parsed.query)
+            target = params.get("u", params.get("url", [""]))[0]
+            if target:
+                # Bing uses a modified base64 without padding starting with 'a1'
+                try:
+                    import base64
+                    if target.startswith("a1"):
+                        padded = target[2:] + "==="
+                        decoded = base64.urlsafe_b64decode(padded).decode("utf-8", errors="ignore")
+                        if decoded.startswith(("http://", "https://")):
+                            return decoded
+                except Exception:  # noqa: BLE001
+                    pass
+                if target.startswith(("http", "%")):
+                    return unquote(target)
+        return value
 
     @staticmethod
     def _unwrap_duckduckgo_url(value: str) -> str:

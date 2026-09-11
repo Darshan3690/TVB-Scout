@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 from agent.orchestrator import ScoutOrchestrator, ScoutRun
 
+
 load_dotenv()
 
 st.set_page_config(page_title="TVB Scout", page_icon="TS", layout="wide")
@@ -85,6 +86,14 @@ st.title("TVB SCOUT")
 st.caption("Autonomous Company Discovery & Verification Agent")
 st.write("Find companies matching TVB's target profile through web and open-source discovery followed by independent, evidence-first validation.")
 
+if not os.getenv("SERPAPI_KEY"):
+    st.warning(
+        "⚠️ **No SERPAPI_KEY detected.** The app falls back to DuckDuckGo → Bing. "
+        "These public endpoints are often rate-limited or blocked in cloud/server environments, which causes 0 research results and 0 qualified leads. "
+        "Add `SERPAPI_KEY=<your key>` to a `.env` file for reliable discovery.",
+        icon=None,
+    )
+
 target = st.number_input("Target leads", min_value=1, max_value=50, value=15, step=1)
 if st.button("Run TVB Scout", type="primary", use_container_width=True):
     activity_box = st.empty()
@@ -100,12 +109,13 @@ if st.button("Run TVB Scout", type="primary", use_container_width=True):
 
 run: ScoutRun | None = st.session_state.get("tvb_run")
 if run:
-    metrics = st.columns(5)
+    metrics = st.columns(6)
     metrics[0].metric("Web candidates", run.web_candidates)
     metrics[1].metric("GitHub candidates", run.github_candidates)
     metrics[2].metric("Unique companies", run.unique_companies)
-    metrics[3].metric("Qualified", len(run.qualified_leads))
-    metrics[4].metric("Rejected", len(run.rejected_leads))
+    metrics[3].metric("Researched", run.researched_companies)
+    metrics[4].metric("Qualified", len(run.qualified_leads))
+    metrics[5].metric("Rejected", len(run.rejected_leads))
 
     qualified_tab, rejected_tab, activity_tab = st.tabs([f"Qualified ({len(run.qualified_leads)})", f"Rejected ({len(run.rejected_leads)})", "Activity"])
     with qualified_tab:
