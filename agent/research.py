@@ -36,6 +36,14 @@ US_HQ_PATTERN = re.compile(
     r"united states|usa|u\.s\.)\b",
     re.I,
 )
+# Many non-US startups incorporate in Delaware/Wyoming as a legal formality.
+# These patterns identify registered-agent / legal-only addresses — not real US offices.
+DELAWARE_AGENT_PATTERN = re.compile(
+    r"\b(registered agent|corporation trust|ct corporation|incorporating services|"
+    r"limestone rd|ste 200|registered office|legal address|\bde\b|19808|19801)\b",
+    re.I,
+)
+DELAWARE_STATE_PATTERN = re.compile(r"\bwilmington\b|\bdelaware\b|\bwyoming\b", re.I)
 
 
 @dataclass(frozen=True)
@@ -71,10 +79,12 @@ class Researcher:
             self._apply_technology(company, tech_search)
             tech = tech_search if tech_search.text else tech
 
-        # US presence — use website text + targeted search + HQ search
+        # US presence — website text + targeted US search + dedicated geography search
         us_presence = self._evidence(name, '"United States" OR USA OR "US office" OR headquarters')
+        # Geography search: specifically surface results that say where the company IS based
+        geo_evidence = self._evidence(name, "Nigeria OR Africa OR India OR Europe OR Kenya OR Ghana OR founded country")
         hq_evidence = self._evidence(name, "founded headquartered based country location")
-        self._apply_us_presence(company, us_presence + hq_evidence, website_text)
+        self._apply_us_presence(company, us_presence + geo_evidence + hq_evidence, website_text)
 
         # Founder — search + website about/team pages
         founder = self._evidence(name, 'CEO OR founder OR "co-founder" OR "founding team"')
@@ -86,16 +96,34 @@ class Researcher:
 
         self._apply_llm_hints(company, tech, founder, us_presence)
 
-        # Email — search + try contact/team pages directly
+        # Email — multiple search angles + fetch several sub-pages directly
         if company.founder_name and company.website:
             domain = normalize_domain(company.website)
-            email_evidence = self._evidence(f'"{company.founder_name}"', f'"@{domain}" email contact')
+            first_name = company.founder_name.split()[0].lower()
+            email_evidence: list[Evidence] = []
+
+            # Search queries (varied so Google doesn't filter all)
+            email_evidence += self._evidence(f'"{company.founder_name}"', f'"@{domain}" email contact')
             email_evidence += self._evidence(f'"{company.founder_name}" "{name}"', f'email @{domain}')
-            contact_text = self._fetch_subpage(company.website, ["/contact", "/team", "/about", "/about-us", "/founders"])
-            if contact_text:
-                email_evidence.append(Evidence(contact_text, company.website + "/contact"))
+            email_evidence += self._evidence(f'"{company.founder_name}"', f'site:{domain} email')
+
+            # Fetch sub-pages directly — try ALL paths, not just the first hit
+            for subpath in ["/about", "/team", "/contact", "/about-us", "/founders",
+                            "/leadership", "/people", "/company", f"/blog/author/{first_name}",
+                            f"/author/{first_name}"]:
+                page_text = self.search.fetch_text(company.website.rstrip("/") + subpath)
+                if page_text and len(page_text) > 200:
+                    email_evidence.append(Evidence(page_text, company.website + subpath))
+
+            # GitHub profile — open-source founders often list email there
+            if company.github_url:
+                gh_text = self.search.fetch_text(company.github_url)
+                if gh_text:
+                    email_evidence.append(Evidence(gh_text, company.github_url))
+
             self._apply_email(company, email_evidence)
         return company
+
 
     def _fetch_subpage(self, base_url: str, paths: list[str]) -> str:
         """Try a list of sub-page paths and return the first non-empty text (>200 chars)."""
@@ -147,7 +175,8 @@ class Researcher:
         """Find a likely first-party site without treating a directory as company evidence."""
         excluded_domains = {
             "github.com", "linkedin.com", "crunchbase.com", "tracxn.com", "facebook.com",
-            "instagram.com", "x.com", "twitter.com", "wikipedia.org",
+            "instagram.com", "x.com", "twitter.com", "wikipedia.org", "techcrunch.com",
+            "ycombinator.com",
         }
         name_tokens = {token.lower() for token in re.findall(r"[A-Za-z0-9]+", company_name) if len(token) > 2}
         for result in self.search.search(f'"{company_name}" official website', limit=5):
@@ -156,7 +185,10 @@ class Researcher:
                 continue
             title = result.title.lower()
             if name_tokens and any(token in title or token in domain for token in name_tokens):
-                return result.url
+                # Return the root domain URL, not a deep sub-page
+                from urllib.parse import urlparse
+                parsed = urlparse(result.url)
+                return f"{parsed.scheme}://{parsed.netloc}/"
         return ""
 
     def _evidence(self, subject: str, qualifier: str) -> list[Evidence]:
@@ -198,7 +230,11 @@ class Researcher:
                 company.industry = match.group(1).title()
 
     def _apply_us_presence(self, company: Company, evidence: list[Evidence], website_text: str = "") -> None:
-        """Accept affirmative evidence of non-US headquarters, explicit no-US, or exclusively-non-US."""
+        """Accept affirmative evidence of non-US headquarters, explicit no-US, or exclusively-non-US.
+
+        Delaware/Wyoming incorporations are legal formalities used by many non-US startups;
+        they are treated as minimal US presence and do not block qualification.
+        """
         all_items = list(evidence)
         if website_text:
             all_items.insert(0, Evidence(website_text, company.website or ""))
@@ -217,16 +253,23 @@ class Researcher:
                 company.us_presence_verified = True
                 company.us_presence_source = item.url
                 return
-            # Headquartered / founded / based in a non-US country — and no conflicting US HQ
-            if NON_US_HQ_PATTERN.search(item.text) and not US_HQ_PATTERN.search(item.text):
-                country_match = NON_US_HQ_PATTERN.search(item.text)
-                country = country_match.group(2).title() if country_match else "non-US country"
-                company.us_presence = f"Headquartered in {country} per public source"
-                company.us_presence_verified = True
-                company.us_presence_source = item.url
-                return
+            # Headquartered / founded / based in a non-US country
+            non_us_match = NON_US_HQ_PATTERN.search(item.text)
+            if non_us_match:
+                us_match = US_HQ_PATTERN.search(item.text)
+                # Allow Delaware/Wyoming incorporation as a legal-only formality
+                is_registered_agent_only = us_match and (
+                    DELAWARE_AGENT_PATTERN.search(item.text) or
+                    DELAWARE_STATE_PATTERN.search(item.text)
+                )
+                if not us_match or is_registered_agent_only:
+                    country = non_us_match.group(2).title()
+                    company.us_presence = f"Headquartered in {country} per public source"
+                    company.us_presence_verified = True
+                    company.us_presence_source = item.url
+                    return
 
-        # Fallback — US presence mentioned but not verified as non-US
+        # Fallback — US presence mentioned but could not verify as non-US
         for item in evidence:
             normalized = item.text.lower()
             if re.search(r"\b(united states|usa|u\.s\.|us office|new york|san francisco)\b", normalized):
