@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 
 from agent.email_finder import find_public_founder_email
+from agent.llm import EvidenceExtractor
 from models.company import Company
 from utils.search import SearchClient, SearchResult
 from utils.sources import normalize_domain
@@ -26,8 +27,9 @@ class Evidence:
 
 
 class Researcher:
-    def __init__(self, search: SearchClient) -> None:
+    def __init__(self, search: SearchClient, extractor: EvidenceExtractor | None = None) -> None:
         self.search = search
+        self.extractor = extractor or EvidenceExtractor()
 
     def research(self, company: Company) -> Company:
         """Enrich one candidate. Every positive verification includes a public source URL."""
@@ -50,10 +52,46 @@ class Researcher:
         founder = self._evidence(name, 'CEO OR founder OR "co-founder"')
         self._apply_founder(company, founder)
 
+        self._apply_llm_hints(company, tech, founder, us_presence)
+
         if company.founder_name and company.website:
             email = self._evidence(f'"{company.founder_name}"', f'"@{normalize_domain(company.website)}" email')
             self._apply_email(company, email)
         return company
+
+    def _apply_llm_hints(
+        self,
+        company: Company,
+        tech: Evidence,
+        founder_evidence: list[Evidence],
+        us_evidence: list[Evidence],
+    ) -> None:
+        """LLM values are hints and still need direct evidence before setting a verified field."""
+        evidence = "\n".join(
+            item.text for item in [tech, *founder_evidence, *us_evidence] if item.text
+        )
+        hints = self.extractor.extract(company.company_name, evidence)
+        if not company.description and hints.get("description"):
+            company.description = hints["description"]
+        if not company.industry and hints.get("industry"):
+            company.industry = hints["industry"]
+        if not company.us_presence and hints.get("us_presence_summary"):
+            company.us_presence = hints["us_presence_summary"]
+        if company.founder_name or not hints.get("founder_name"):
+            return
+
+        hinted_name = hints["founder_name"]
+        hinted_role = hints.get("founder_role", "")
+        if hinted_role not in {"CEO", "Founder", "Co-founder", "Founder & CEO", "Co-founder & CEO"}:
+            return
+        name_tokens = re.findall(r"[A-Za-z]+", hinted_name.lower())
+        for item in founder_evidence:
+            lower_evidence = item.text.lower()
+            if name_tokens and all(token in lower_evidence for token in name_tokens) and hinted_role.lower() in lower_evidence:
+                company.founder_name = hinted_name
+                company.founder_role = hinted_role
+                company.founder_source = item.url
+                return
 
     def _resolve_official_website(self, company_name: str) -> str:
         """Find a likely first-party site without treating a directory as company evidence."""

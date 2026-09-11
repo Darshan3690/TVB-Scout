@@ -41,6 +41,7 @@ Streamlit UI
 - Web queries are generated from technology, geography, and funding term combinations at runtime.
 - GitHub repository search supplies only candidate signals; stars never count as funding proof.
 - Research requests targeted public evidence for funding, platform capabilities, US presence, founder identity, and founder email.
+- When `LLM_API_KEY` and `OPENAI_MODEL` are configured, an optional structured extraction adapter reads only the evidence already collected by the app. Its output is treated as a hint and cannot bypass direct evidence checks or deterministic qualification.
 - Final qualification is code in `agent/filter.py`, not an LLM decision.
 - The rejected tab retains every rejected candidate with its first deterministic failure reason.
 
@@ -67,7 +68,8 @@ Copy `.env.example` to `.env` and only add keys you own.
 
 - `SERPAPI_KEY` (optional): higher-volume web search.
 - `GITHUB_TOKEN` (optional): higher GitHub API rate limit.
-- `LLM_API_KEY` (reserved for a future structured LLM research adapter).
+- `LLM_API_KEY` (optional: enables structured LLM evidence extraction with `OPENAI_MODEL`).
+- `OPENAI_MODEL` (required together with `LLM_API_KEY` to enable structured evidence extraction).
 
 No API key is required to launch the app. Public discovery endpoints can be rate-limited, so an empty result is handled safely and shown in the activity log.
 
@@ -78,6 +80,16 @@ pytest
 ```
 
 The test suite covers funding bounds, final qualification, domain/name de-duplication, and founder-email validation.
+
+## Deployment
+
+The repository includes a `Dockerfile` and `render.yaml` for a Render web-service deployment. Configure optional keys in the host's secret manager, never in Git:
+
+1. Create a new Render Blueprint from this repository.
+2. Add `SERPAPI_KEY`, `GITHUB_TOKEN`, and any LLM credentials only when available.
+3. Deploy and open the generated service URL.
+
+The app remains usable without optional keys, subject to public search and GitHub rate limits.
 
 ## Limitations
 
