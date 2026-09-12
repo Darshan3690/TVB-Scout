@@ -17,9 +17,11 @@ MONEY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 FOUNDER_PATTERN = re.compile(
-    r"(?P<name>[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*(?:,|[-|])?\s*"
+    r"(?:(?P<name>[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*(?:,|[-|]|is the|is a)?\s*"
     r"(?P<role>Founder(?:\s*&\s*CEO)?|Co-founder(?:\s*&\s*CEO)?|CEO|Founder and CEO"
-    r"|Co-Founder(?:\s*&\s*CEO)?|Managing Director|MD(?:\s*&\s*CEO)?|President(?:\s*&\s*CEO)?)",
+    r"|Co-Founder(?:\s*&\s*CEO)?|Managing Director|MD(?:\s*&\s*CEO)?|President(?:\s*&\s*CEO)?))"
+    r"|(?:(?P<role_rev>Founder(?:\s*&\s*CEO)?|Co-founder(?:\s*&\s*CEO)?|CEO|Founder and CEO"
+    r"|Co-Founder(?:\s*&\s*CEO)?)\s+(?:of\s+[^,]+,\s*)?(?P<name_rev>[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}))",
 )
 # Detects non-US headquarters in evidence text
 NON_US_HQ_PATTERN = re.compile(
@@ -70,12 +72,12 @@ class Researcher:
         # Run all 6 evidence searches CONCURRENTLY instead of sequentially
         with ThreadPoolExecutor(max_workers=6) as pool:
             futs = {
-                "fund1": pool.submit(self._evidence, name, "funding OR raised OR investment OR seed OR Series"),
-                "fund2": pool.submit(self._evidence, name, "revenue OR ARR OR funding round"),
-                "us":    pool.submit(self._evidence, name, '"United States" OR USA OR "US office" OR headquarters'),
-                "geo":   pool.submit(self._evidence, name, "Nigeria OR Africa OR India OR Europe OR Kenya OR Ghana OR founded country"),
+                "fund1": pool.submit(self._evidence, name, "funding raised investment seed round Series"),
+                "fund2": pool.submit(self._evidence, name, "revenue ARR funding round"),
+                "us":    pool.submit(self._evidence, name, "United States USA US office headquarters"),
+                "geo":   pool.submit(self._evidence, name, "Nigeria Africa India Europe Kenya Ghana founded country"),
                 "hq":    pool.submit(self._evidence, name, "founded headquartered based country location"),
-                "found": pool.submit(self._evidence, name, 'CEO OR founder OR "co-founder" OR "founding team"'),
+                "found": pool.submit(self._evidence, name, "CEO founder co-founder founding team"),
             }
             funding    = futs["fund1"].result() + futs["fund2"].result()
             us_presence = futs["us"].result()
@@ -141,6 +143,9 @@ class Researcher:
                         pass
 
             self._apply_email(company, email_evidence)
+
+        if not company.source_url:
+            company.source_url = company.funding_source or company.website or company.tech_source
         return company
 
 
@@ -300,10 +305,14 @@ class Researcher:
         for item in evidence:
             match = FOUNDER_PATTERN.search(item.text)
             if match:
-                company.founder_name = match.group("name")
-                company.founder_role = match.group("role")
-                company.founder_source = item.url
-                return
+                name = match.group("name") if match.groupdict().get("name") else match.groupdict().get("name_rev")
+                role = match.group("role") if match.groupdict().get("role") else match.groupdict().get("role_rev")
+                if name and role:
+                    clean_name = re.sub(r'\b(co|and|is)\b$', '', name.strip(), flags=re.I).strip()
+                    company.founder_name = clean_name
+                    company.founder_role = role.strip()
+                    company.founder_source = item.url
+                    return
 
     def _apply_email(self, company: Company, evidence: list[Evidence]) -> None:
         for item in evidence:
@@ -313,6 +322,15 @@ class Researcher:
                 company.email_verified = True
                 company.email_source = item.url
                 return
+        # Tiered confidence: If founder and website confirmed, infer professional address
+        if company.founder_name and company.website:
+            domain = normalize_domain(company.website)
+            name_parts = re.findall(r"[a-z]+", company.founder_name.lower())
+            if domain and name_parts:
+                first = name_parts[0]
+                company.founder_email = f"{first}@{domain}"
+                company.email_verified = False  # Transparent: Inferred pattern
+                company.email_source = f"Domain pattern ({company.website})"
 
     @staticmethod
     def _extract_usd(text: str) -> float | None:

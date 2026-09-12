@@ -13,6 +13,7 @@ from agent.github_discovery import GitHubDiscovery
 from agent.research import Researcher
 from models.company import Company
 from utils.search import SearchClient
+from utils.sources import normalize_domain, normalize_name
 
 EventCallback = Callable[[str], None]
 
@@ -81,10 +82,13 @@ class ScoutOrchestrator:
             # Build this round's research batch (unprocessed candidates only)
             to_research: list[Company] = []
             for candidate in unique_candidates:
-                key = candidate.website or candidate.github_url or candidate.company_name.lower()
-                if key in processed_keys:
+                name_k = f"name:{normalize_name(candidate.company_name)}"
+                domain_k = f"domain:{normalize_domain(candidate.website)}" if candidate.website else ""
+                if name_k in processed_keys or (domain_k and domain_k in processed_keys):
                     continue
-                processed_keys.add(key)
+                processed_keys.add(name_k)
+                if domain_k:
+                    processed_keys.add(domain_k)
                 to_research.append(candidate)
                 if len(to_research) >= max_candidates_per_round:
                     self._emit(run, f"[RESEARCH] Round budget reached ({max_candidates_per_round} companies)")
@@ -125,6 +129,10 @@ class ScoutOrchestrator:
                     self._emit(run, f"[DEDUP] Post-research duplicate: {researched.company_name}")
                     continue
                 result_by_key[resolved_key] = researched
+                if researched.website:
+                    processed_keys.add(f"domain:{normalize_domain(researched.website)}")
+                if researched.company_name:
+                    processed_keys.add(f"name:{normalize_name(researched.company_name)}")
                 classify(researched)
                 if researched.qualified:
                     run.qualified_leads.append(researched)
@@ -142,4 +150,7 @@ class ScoutOrchestrator:
     def _emit(self, run: ScoutRun, message: str) -> None:
         run.activity.append(message)
         if self.event_callback:
-            self.event_callback(message)
+            try:
+                self.event_callback(message)
+            except Exception:
+                pass

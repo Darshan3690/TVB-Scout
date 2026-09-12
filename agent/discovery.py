@@ -20,7 +20,7 @@ TECH_TERMS = (
     "machine learning platform",
 )
 GEOGRAPHIES = ("India", "Africa", "Europe", "Southeast Asia", "Latin America", "Middle East")
-FUNDING_TERMS = ("raised funding", "seed round", "venture funding", "investment")
+FUNDING_TERMS = ("seed round", "seed funding", "pre-seed", "raised $1M", "raised $2M", "raised $3M", "Series Seed")
 
 
 class WebDiscovery:
@@ -57,16 +57,46 @@ class WebDiscovery:
     def _candidate_name(title: str) -> str:
         title = title.strip()
         funding_match = re.search(
-            r"^(.{2,100}?)\s+(?:raises?|raised|secures?|secured|lands?|landed|bags?|bagged|closes?|closed)\b",
+            r"^(.{2,60}?)\s+(?:raises?|raised|secures?|secured|lands?|landed|bags?|bagged|closes?|closed)\b",
             title,
             re.I,
         )
         if funding_match:
-            return funding_match.group(1).strip(" -:|")
-        if any(term in title.lower() for term in ("top ", "list of", "startups funded", "market trends", "directory")):
+            candidate = funding_match.group(1).strip(" -:|")
+            if not any(stop in candidate.lower() for stop in ("how ", "why ", "what ", "here are", "report", "news")):
+                name = candidate
+            else:
+                name = ""
+        else:
+            # Filter out common junk titles
+            junk_terms = (
+                "top ", "list of", "startups funded", "market trends", "directory", "boom",
+                "how to", "report", "roundup", "grant", "financing", "overview", "guide",
+                "landscape", "here are", "biggest", "tracker", "funding in", "venture capital in",
+                "top 10", "trends", "news", "explained", "analysis", "podcast", "episode",
+                "ecosystem", "outlook", "hub", "biggest ai startups",
+            )
+            lower = title.lower()
+            if any(term in lower for term in junk_terms):
+                return ""
+
+            for separator in (" | ", " - ", " -", ":"):
+                if separator in title:
+                    title = title.split(separator, 1)[0]
+                    break
+            name = title.strip()
+
+        # Reject long sentences or non-company names
+        if len(name.split()) > 4 or len(name) > 35 or len(name) < 2:
             return ""
-        for separator in (" | ", " - ", " -", ":"):
-            if separator in title:
-                title = title.split(separator, 1)[0]
-                break
-        return title.strip()[:120]
+        # Reject VC funds, accelerators, and ecosystem lists
+        non_company_words = {
+            "funding", "startup", "startups", "investors", "investing", "market",
+            "india's", "africa's", "europe's", "billion", "million", "fund", "funds",
+            "venture", "ventures", "capital", "accelerator", "incubator", "lab", "labs",
+            "partners", "vc", "holdings", "group"
+        }
+        tokens = {w.lower().strip(".,'\"") for w in name.split()}
+        if tokens & non_company_words:
+            return ""
+        return name

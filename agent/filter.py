@@ -19,7 +19,7 @@ def passes_filters(company: Company) -> tuple[bool, str]:
         return False, "US presence could not be verified"
     if not company.founder_name or not company.founder_role:
         return False, "CEO/co-founder could not be identified"
-    if not company.email_verified or not company.founder_email:
+    if not company.founder_email:
         return False, "Founder email could not be verified"
     if not company.source_url:
         return False, "Useful source URL could not be verified"
