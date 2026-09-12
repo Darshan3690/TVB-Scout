@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -60,8 +61,14 @@ class ScoutOrchestrator:
             if len(run.qualified_leads) >= target_leads:
                 break
             self._emit(run, f"[DISCOVERY] Round {round_index + 1}/{max_discovery_rounds}")
-            web = self.web_discovery.discover(round_index)
-            github = self.github_discovery.discover(round_index)
+
+            # Run web + github discovery concurrently
+            with ThreadPoolExecutor(max_workers=2) as disc_pool:
+                f_web = disc_pool.submit(self.web_discovery.discover, round_index)
+                f_gh  = disc_pool.submit(self.github_discovery.discover, round_index)
+                web    = f_web.result()
+                github = f_gh.result()
+
             run.web_candidates += len(web)
             run.github_candidates += len(github)
             self._emit(run, f"[DISCOVERY] Web candidates: +{len(web)} | GitHub candidates: +{len(github)}")
@@ -71,24 +78,41 @@ class ScoutOrchestrator:
             run.unique_companies = len(unique_candidates)
             self._emit(run, f"[DEDUP] Unique companies: {run.unique_companies}")
 
-            round_researched = 0
+            # Build this round's research batch (unprocessed candidates only)
+            to_research: list[Company] = []
             for candidate in unique_candidates:
                 key = candidate.website or candidate.github_url or candidate.company_name.lower()
                 if key in processed_keys:
                     continue
-                if round_researched >= max_candidates_per_round:
+                processed_keys.add(key)
+                to_research.append(candidate)
+                if len(to_research) >= max_candidates_per_round:
                     self._emit(run, f"[RESEARCH] Round budget reached ({max_candidates_per_round} companies)")
                     break
-                processed_keys.add(key)
-                round_researched += 1
-                self._emit(run, f"[RESEARCH] Researching {candidate.company_name}")
+
+            if not to_research:
+                continue
+
+            self._emit(run, f"[RESEARCH] Researching {len(to_research)} companies in parallel (3 workers)")
+
+            def _safe_research(candidate: Company) -> Company:
                 try:
-                    researched = self.researcher.research(candidate)
-                except Exception as error:  # A candidate must never terminate the full run.
-                    researched = candidate
-                    researched.rejection_reason = f"Research failed: {type(error).__name__}"
-                    self._emit(run, f"[RESEARCH] Failed safely for {candidate.company_name}")
+                    return self.researcher.research(candidate)
+                except Exception as error:  # noqa: BLE001
+                    candidate.rejection_reason = f"Research failed: {type(error).__name__}"
+                    return candidate
+
+            # Research up to 3 companies concurrently, then process results sequentially
+            researched_batch: list[Company] = [None] * len(to_research)  # type: ignore[list-item]
+            with ThreadPoolExecutor(max_workers=3) as res_pool:
+                future_to_idx = {res_pool.submit(_safe_research, c): i for i, c in enumerate(to_research)}
+                for future in as_completed(future_to_idx):
+                    researched_batch[future_to_idx[future]] = future.result()
+
+            # Process results in main thread (keeps _emit and list mutations thread-safe)
+            for researched in researched_batch:
                 run.researched_companies += 1
+                self._emit(run, f"[RESEARCH] Researching {researched.company_name}")
                 self._emit(run, f"  funding_verified={researched.funding_verified}  usd={researched.funding_usd}  ({researched.funding_or_revenue})")
                 self._emit(run, f"  tech_verified={researched.tech_verified}  ({researched.tech_platform[:60] if researched.tech_platform else '-'})")
                 self._emit(run, f"  us_presence_verified={researched.us_presence_verified}  ({researched.us_presence[:60] if researched.us_presence else '-'})")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from agent.email_finder import find_public_founder_email
@@ -66,12 +67,25 @@ class Researcher:
         if website_text and not company.description:
             company.description = website_text[:500]
 
-        # Funding — try multiple query angles
-        funding = self._evidence(name, "funding OR raised OR investment OR seed OR Series")
-        funding += self._evidence(name, "revenue OR ARR OR funding round")
+        # Run all 6 evidence searches CONCURRENTLY instead of sequentially
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futs = {
+                "fund1": pool.submit(self._evidence, name, "funding OR raised OR investment OR seed OR Series"),
+                "fund2": pool.submit(self._evidence, name, "revenue OR ARR OR funding round"),
+                "us":    pool.submit(self._evidence, name, '"United States" OR USA OR "US office" OR headquarters'),
+                "geo":   pool.submit(self._evidence, name, "Nigeria OR Africa OR India OR Europe OR Kenya OR Ghana OR founded country"),
+                "hq":    pool.submit(self._evidence, name, "founded headquartered based country location"),
+                "found": pool.submit(self._evidence, name, 'CEO OR founder OR "co-founder" OR "founding team"'),
+            }
+            funding    = futs["fund1"].result() + futs["fund2"].result()
+            us_presence = futs["us"].result()
+            geo_evidence = futs["geo"].result()
+            hq_evidence  = futs["hq"].result()
+            founder      = futs["found"].result()
+
         self._apply_funding(company, funding)
 
-        # Technology — try website first, then search
+        # Technology — try website first, then a search fallback
         tech = Evidence(website_text, company.website) if website_text else Evidence("", "")
         self._apply_technology(company, tech)
         if not company.tech_verified:
@@ -79,15 +93,8 @@ class Researcher:
             self._apply_technology(company, tech_search)
             tech = tech_search if tech_search.text else tech
 
-        # US presence — website text + targeted US search + dedicated geography search
-        us_presence = self._evidence(name, '"United States" OR USA OR "US office" OR headquarters')
-        # Geography search: specifically surface results that say where the company IS based
-        geo_evidence = self._evidence(name, "Nigeria OR Africa OR India OR Europe OR Kenya OR Ghana OR founded country")
-        hq_evidence = self._evidence(name, "founded headquartered based country location")
         self._apply_us_presence(company, us_presence + geo_evidence + hq_evidence, website_text)
 
-        # Founder — search + website about/team pages
-        founder = self._evidence(name, 'CEO OR founder OR "co-founder" OR "founding team"')
         self._apply_founder(company, founder)
         if not company.founder_name and company.website:
             about_text = self._fetch_subpage(company.website, ["/about", "/team", "/about-us", "/leadership", "/founders"])
@@ -96,30 +103,42 @@ class Researcher:
 
         self._apply_llm_hints(company, tech, founder, us_presence)
 
-        # Email — multiple search angles + fetch several sub-pages directly
+        # Email — search queries + sub-page fetches ALL run concurrently
         if company.founder_name and company.website:
             domain = normalize_domain(company.website)
             first_name = company.founder_name.split()[0].lower()
             email_evidence: list[Evidence] = []
+            base = company.website.rstrip("/")
+            sub_paths = ["/about", "/team", "/contact", "/about-us", "/founders"]
 
-            # Search queries (varied so Google doesn't filter all)
-            email_evidence += self._evidence(f'"{company.founder_name}"', f'"@{domain}" email contact')
-            email_evidence += self._evidence(f'"{company.founder_name}" "{name}"', f'email @{domain}')
-            email_evidence += self._evidence(f'"{company.founder_name}"', f'site:{domain} email')
+            # Parallel: 3 search queries + 5 sub-page fetches + optional GitHub
+            tasks: dict[str, object] = {}
+            with ThreadPoolExecutor(max_workers=9) as pool:
+                tasks["eq1"] = pool.submit(self._evidence, f'"{company.founder_name}"', f'"@{domain}" email contact')
+                tasks["eq2"] = pool.submit(self._evidence, f'"{company.founder_name}" "{name}"', f'email @{domain}')
+                tasks["eq3"] = pool.submit(self._evidence, f'"{company.founder_name}"', f'site:{domain} email')
+                for sp in sub_paths:
+                    tasks[sp] = pool.submit(self.search.fetch_text, base + sp)
+                if company.github_url:
+                    tasks["gh"] = pool.submit(self.search.fetch_text, company.github_url)
 
-            # Fetch sub-pages directly — try ALL paths, not just the first hit
-            for subpath in ["/about", "/team", "/contact", "/about-us", "/founders",
-                            "/leadership", "/people", "/company", f"/blog/author/{first_name}",
-                            f"/author/{first_name}"]:
-                page_text = self.search.fetch_text(company.website.rstrip("/") + subpath)
-                if page_text and len(page_text) > 200:
-                    email_evidence.append(Evidence(page_text, company.website + subpath))
-
-            # GitHub profile — open-source founders often list email there
-            if company.github_url:
-                gh_text = self.search.fetch_text(company.github_url)
-                if gh_text:
-                    email_evidence.append(Evidence(gh_text, company.github_url))
+                email_evidence += tasks["eq1"].result()
+                email_evidence += tasks["eq2"].result()
+                email_evidence += tasks["eq3"].result()
+                for sp in sub_paths:
+                    try:
+                        text = tasks[sp].result(timeout=15)
+                        if text and len(text) > 200:
+                            email_evidence.append(Evidence(text, base + sp))
+                    except Exception:  # noqa: BLE001
+                        pass
+                if "gh" in tasks:
+                    try:
+                        gh_text = tasks["gh"].result(timeout=15)
+                        if gh_text:
+                            email_evidence.append(Evidence(gh_text, company.github_url))
+                    except Exception:  # noqa: BLE001
+                        pass
 
             self._apply_email(company, email_evidence)
         return company
