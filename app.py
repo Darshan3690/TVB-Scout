@@ -145,11 +145,12 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ── SERPAPI warning ────────────────────────────────────────────────────────────
-if not os.getenv("SERPAPI_KEY"):
+# ── Search API Status Banner ───────────────────────────────────────────────────
+has_search_key = bool(os.getenv("SERPER_API_KEY") or os.getenv("TAVILY_API_KEY") or os.getenv("SERPAPI_KEY"))
+if not has_search_key:
     st.markdown("""<div class="tvb-warning">
-      ⚠️ <strong>No SERPAPI_KEY detected.</strong>
-      Add <code>SERPAPI_KEY=&lt;key&gt;</code> to your <code>.env</code> file.
+      ⚠️ <strong>No Search API Key detected.</strong>
+      Add <code>SERPER_API_KEY=&lt;key&gt;</code> to your <code>.env</code> file.
     </div>""", unsafe_allow_html=True)
 
 # ── Controls ───────────────────────────────────────────────────────────────────
