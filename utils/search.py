@@ -48,7 +48,7 @@ def _make_session(timeout_seconds: int) -> requests.Session:
 class SearchClient:
     """Uses SerpAPI when configured, otherwise tries DuckDuckGo then Bing."""
 
-    def __init__(self, timeout_seconds: int = 15) -> None:
+    def __init__(self, timeout_seconds: int = 20) -> None:
         self.timeout_seconds = timeout_seconds
         self.session = _make_session(timeout_seconds)
 
@@ -93,19 +93,30 @@ class SearchClient:
         return html.unescape(re.sub(r"\s+", " ", text)).strip()[:max_chars]
 
     def _search_serpapi(self, query: str, limit: int) -> list[SearchResult]:
-        response = self.session.get(
-            "https://serpapi.com/search.json",
-            params={"q": query, "api_key": os.environ["SERPAPI_KEY"], "engine": "google"},
-            timeout=self.timeout_seconds,
-        )
-        response.raise_for_status()
-        payload: dict[str, Any] = response.json()
-        results = []
-        for item in payload.get("organic_results", [])[:limit]:
-            url = item.get("link", "")
-            if url:
-                results.append(SearchResult(item.get("title", ""), url, item.get("snippet", "")))
-        return results
+        import time
+        last_error: Exception | None = None
+        for attempt in range(3):  # up to 3 attempts on timeout
+            try:
+                response = self.session.get(
+                    "https://serpapi.com/search.json",
+                    params={"q": query, "api_key": os.environ["SERPAPI_KEY"], "engine": "google"},
+                    timeout=self.timeout_seconds,
+                )
+                response.raise_for_status()
+                payload: dict[str, Any] = response.json()
+                results = []
+                for item in payload.get("organic_results", [])[:limit]:
+                    url = item.get("link", "")
+                    if url:
+                        results.append(SearchResult(item.get("title", ""), url, item.get("snippet", "")))
+                return results
+            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as e:
+                last_error = e
+                LOGGER.warning("SerpAPI timeout (attempt %d/3) for %r — retrying in 2s", attempt + 1, query)
+                time.sleep(2)
+            except (requests.RequestException, ValueError, TypeError) as e:
+                raise  # non-timeout errors propagate immediately
+        raise last_error  # type: ignore[misc]
 
     def _search_duckduckgo(self, query: str, limit: int) -> list[SearchResult]:
         response = self.session.post(
