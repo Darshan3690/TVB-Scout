@@ -66,12 +66,13 @@ streamlit run app.py
 
 Copy `.env.example` to `.env` and only add keys you own.
 
-- `SERPAPI_KEY` (optional): higher-volume web search.
+- `SERPER_API_KEY` (recommended): Google search engine in clean JSON format via Serper.dev (2,500 free queries).
+- `TAVILY_API_KEY` (optional): Tavily Search API (1,000 free queries).
 - `GITHUB_TOKEN` (optional): higher GitHub API rate limit.
 - `LLM_API_KEY` (optional: enables structured LLM evidence extraction with `OPENAI_MODEL`).
 - `OPENAI_MODEL` (required together with `LLM_API_KEY` to enable structured evidence extraction).
 
-No API key is required to launch the app. Public discovery endpoints can be rate-limited, so an empty result is handled safely and shown in the activity log.
+No API key is required to launch the app. When keys are present, search runs against high-throughput JSON APIs with automatic retry and rate-limiting backoff.
 
 ## Testing
 
